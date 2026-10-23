@@ -1,7 +1,8 @@
 import { expect, test } from './fixtures';
-import { UNKNOWN_UUID } from './helpers/constants';
+import { CACHE_HEADER, UNKNOWN_UUID } from './helpers/constants';
 import { dateRange } from './helpers/dates';
-import { uniqueName } from './helpers/entities';
+import { createWebsite, deleteWebsite, uniqueName } from './helpers/entities';
+import { PERSONAS } from './seed/dataset';
 
 /**
  * Global setup records one replay on `seed.website` (see seed/dataset.ts):
@@ -92,6 +93,123 @@ test.describe('Replays', () => {
     expect(denied.status).toBe(401);
     expect(missingRange.status).toBe(400);
     expect(badDuration.status).toBe(400);
+  });
+
+  test('replay duration and minimum filter use each visit timeline across chunks', async ({
+    api,
+    admin,
+    seed,
+  }) => {
+    const website = await createWebsite(admin);
+
+    try {
+      const configured = await admin.post(`/api/websites/${website.id}`, {
+        replayConfig: { replayEnabled: true, sampleRate: 1 },
+      });
+      expect(configured.status).toBe(200);
+
+      const start = Math.floor(Date.now() / 3_600_000) * 3_600_000 - 14_400_000;
+      const identity = uniqueName('replay-duration');
+      const cases = [
+        // Arrive out of order; neither upload has any internal duration.
+        {
+          chunks: [
+            [108_000, 108_000],
+            [0, 0],
+          ],
+          duration: 108_000,
+        },
+        // The exact default threshold is inclusive.
+        { chunks: [[0, 5_000]], duration: 5_000 },
+        // Overlapping uploads must not turn a four-second visit into seven seconds.
+        {
+          chunks: [
+            [0, 4_000],
+            [1_000, 4_000],
+          ],
+          duration: 4_000,
+        },
+        { chunks: [[0, 1_000]], duration: 1_000 },
+      ];
+      const visits: { id: string; duration: number; chunkCount: number }[] = [];
+      const sessions = new Set<string>();
+
+      for (const [index, item] of cases.entries()) {
+        // One session across separate hourly visits: duration must stay visit-scoped.
+        const visitStart = start + index * 3_600_000;
+        const visit = await api.post('/api/send', {
+          type: 'event',
+          payload: {
+            website: website.id,
+            hostname: website.domain,
+            url: '/',
+            id: identity,
+            ip: '10.0.9.2',
+            userAgent: PERSONAS[0].userAgent,
+            timestamp: visitStart / 1000,
+          },
+        });
+        expect(visit.status).toBe(200);
+        expect(visit.body.cache).toEqual(expect.any(String));
+        sessions.add(visit.body.sessionId);
+        visits.push({
+          id: visit.body.visitId,
+          duration: item.duration,
+          chunkCount: item.chunks.length,
+        });
+
+        for (const [chunkIndex, [first, last]] of item.chunks.entries()) {
+          const recorded = await api.post(
+            '/api/record',
+            {
+              type: 'record',
+              payload: {
+                website: website.id,
+                timestamp: visitStart / 1000 + chunkIndex,
+                events: [first, last].map(offset => ({
+                  type: 3,
+                  data: { source: 1, positions: [] },
+                  timestamp: visitStart + offset,
+                })),
+              },
+            },
+            { headers: { [CACHE_HEADER]: visit.body.cache } },
+          );
+          expect(recorded.status).toBe(200);
+          expect(recorded.body).toEqual({ ok: true });
+        }
+      }
+
+      expect(sessions.size).toBe(1);
+      expect(new Set(visits.map(visit => visit.id)).size).toBe(cases.length);
+      const params = dateRange(seed, { pageSize: 100 });
+      const path = `/api/websites/${website.id}/replays`;
+
+      // Poll for ClickHouse ingestion visibility without weakening the assertions.
+      await expect(async () => {
+        const all = await admin.get(path, { params });
+        expect(all.status).toBe(200);
+        expect(all.body.count).toBe(cases.length);
+        for (const visit of visits) {
+          const replay = all.body.data.find((row: any) => row.id === visit.id);
+          expect(replay).toMatchObject({ duration: visit.duration, chunkCount: visit.chunkCount });
+          expect(new Date(replay.endedAt).getTime() - new Date(replay.startedAt).getTime()).toBe(
+            visit.duration,
+          );
+        }
+        const filtered = await admin.get(path, { params: { ...params, minDuration: 5 } });
+        expect(filtered.status).toBe(200);
+        expect(filtered.body.count).toBe(2);
+        expect(filtered.body.data.map((row: any) => row.id).sort()).toEqual(
+          visits
+            .filter(visit => visit.duration >= 5_000)
+            .map(visit => visit.id)
+            .sort(),
+        );
+      }).toPass({ timeout: 15_000 });
+    } finally {
+      await deleteWebsite(admin, website.id);
+    }
   });
 
   test('GET /api/websites/{websiteId}/replays/{replayId} returns the recorded events', async ({
